@@ -40,7 +40,6 @@ PREFS = {
 client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
 def call_claude(system: str, user: str, max_tokens: int = 2500) -> str:
-    """Call Claude with web search enabled and return text response."""
     response = client.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=max_tokens,
@@ -52,12 +51,32 @@ def call_claude(system: str, user: str, max_tokens: int = 2500) -> str:
 
 
 def parse_json(raw: str):
-    """Strip markdown fences and parse first JSON array or object found."""
+    """Robustly extract and parse the first valid JSON array or object."""
     clean = re.sub(r"```json\s*|```", "", raw).strip()
-    for pattern in (r"\[.*\]", r"\{.*\}"):
-        m = re.search(pattern, clean, re.DOTALL)
-        if m:
-            return json.loads(m.group())
+
+    # Try direct parse first
+    try:
+        return json.loads(clean)
+    except Exception:
+        pass
+
+    # Walk through string finding balanced brackets
+    for start_char, end_char in [('[', ']'), ('{', '}')]:
+        start = clean.find(start_char)
+        if start == -1:
+            continue
+        depth = 0
+        for i, ch in enumerate(clean[start:], start):
+            if ch == start_char:
+                depth += 1
+            elif ch == end_char:
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(clean[start:i+1])
+                    except Exception:
+                        break
+
     raise ValueError("No JSON found in response")
 
 
@@ -65,7 +84,7 @@ def parse_json(raw: str):
 
 def fetch_quote(today: str) -> dict:
     raw = call_claude(
-        "Return ONLY valid JSON: {\"quote\":\"...\",\"author\":\"...\"}. No markdown.",
+        "Return ONLY valid JSON: {\"quote\":\"...\",\"author\":\"...\"}. No markdown, no extra text.",
         f"One timeless, meditative morning quote for {today}. Topics: {', '.join(PREFS['topics'])}.",
         300,
     )
@@ -77,7 +96,7 @@ def fetch_quote(today: str) -> dict:
 
 def fetch_markets(today: str) -> list:
     raw = call_claude(
-        "Return ONLY a valid JSON array. Each item: {\"symbol\":\"...\",\"price\":\"...\",\"change\":\"...\",\"direction\":\"up|down|flat\"}. No markdown.",
+        "Return ONLY a valid JSON array. Each item: {\"symbol\":\"...\",\"price\":\"...\",\"change\":\"...\",\"direction\":\"up|down|flat\"}. No markdown, no extra text outside the array.",
         f"Today is {today}. Current prices for: S&P 500, Dow Jones, NASDAQ, 10-yr Treasury yield, WTI Crude Oil, Gold.",
         600,
     )
@@ -94,13 +113,13 @@ Categories: {', '.join(PREFS['categories'])}.
 Exclude: {', '.join(PREFS['excludes'])}.
 Preferred sources: {', '.join(PREFS['sources'])}.
 Blocked sources: {', '.join(PREFS['blocked'])}.
-Return ONLY a valid JSON array. Each object:
-{{"eyebrow":"CATEGORY","headline":"...","source":"...","byline":"","digest":"2-3 sentence summary","url":"real article URL","tier":1|2|3}}
+Return ONLY a valid JSON array with no text before or after it. Each object:
+{{"eyebrow":"CATEGORY","headline":"...","source":"...","byline":"","digest":"2-3 sentence summary","url":"real article URL","tier":1}}
 Tier 1 = top 2 most important stories. Tier 2 = business/tech/science (3 stories). Tier 3 = world/health/policy (4-6 stories).
-Total: 9-11 articles. Every article MUST have a real working URL."""
+Total: 9-11 articles. Every article MUST have a real working URL. Output ONLY the JSON array."""
     raw = call_claude(
         sys_prompt,
-        f"Today is {today}. Search for the most important news right now across all my interest areas. Return 9-11 articles as JSON.",
+        f"Today is {today}. Search for the most important news right now. Return 9-11 articles as a JSON array only.",
         3500,
     )
     return parse_json(raw)
@@ -108,16 +127,23 @@ Total: 9-11 articles. Every article MUST have a real working URL."""
 
 def fetch_sports(today: str) -> dict:
     sys_prompt = f"""You are a sports editor. User follows: {', '.join(PREFS['leagues'])}. Favorite teams: {', '.join(PREFS['teams'])}.
-Return ONLY a valid JSON object with two keys:
-"scores": [{{"league":"NFL","home":"Team A","homeScore":"21","away":"Team B","awayScore":"14","status":"Final","winner":"home|away|none"}}]
-"stories": [{{"eyebrow":"NFL","headline":"...","source":"...","digest":"2-3 sentences","url":"real URL"}}]
-5-8 scores, 3-4 stories. Prioritize Houston Texans, Houston Astros, Texas A&M. No markdown."""
+Return ONLY a valid JSON object with exactly two keys, no text before or after:
+{{"scores": [{{"league":"NFL","home":"Team A","homeScore":"21","away":"Team B","awayScore":"14","status":"Final","winner":"home"}}],
+"stories": [{{"eyebrow":"NFL","headline":"...","source":"...","digest":"2-3 sentences","url":"real URL"}}]}}
+Include 5-8 scores and 3-4 stories. Prioritize Houston Texans, Houston Astros, Texas A&M. Output ONLY the JSON object."""
     raw = call_claude(
         sys_prompt,
-        f"Today is {today}. Latest scores and top sports news for NFL, MLB, NHL, College Football, College Basketball, Golf. Focus on Texans, Astros, Texas A&M.",
+        f"Today is {today}. Latest scores and top sports news for NFL, MLB, NHL, College Football, College Basketball, Golf. Focus on Texans, Astros, Texas A&M. Return JSON object only.",
         2000,
     )
-    return parse_json(raw)
+    try:
+        result = parse_json(raw)
+        # Ensure it's a dict with the right keys
+        if isinstance(result, dict) and ("scores" in result or "stories" in result):
+            return result
+        return {"scores": [], "stories": []}
+    except Exception:
+        return {"scores": [], "stories": []}
 
 
 # ── HTML BUILDER ─────────────────────────────────────────────────────────────
@@ -148,30 +174,25 @@ def build_email_html(today: str, quote: dict, markets: list, articles: list, spo
     tier2 = [a for a in articles if a.get("tier") == 2][:3]
     tier3 = [a for a in articles if a.get("tier") == 3]
 
-    # Markets bar
     tickers_html = ""
     for t in markets:
         color = direction_color(t.get("direction","flat"))
         tickers_html += f'<span style="margin-right:20px;white-space:nowrap"><span style="color:#ccc;font-size:11px">{t.get("symbol","")} </span><span style="color:#fff;font-size:11px">{t.get("price","")} </span><span style="color:{color};font-size:11px">{t.get("change","")}</span></span>'
 
-    # Top stories — 2 column
     top_html = ""
     for i, a in enumerate(tier1):
         border = 'border-left:1px solid #ddd;padding-left:20px' if i == 1 else ''
         top_html += f'<td valign="top" style="width:50%;{border};padding-bottom:0">{article_html(a,"20px",True)}</td>'
 
-    # Mid stories — 3 column
     mid_html = ""
     for i, a in enumerate(tier2):
         border = 'border-left:1px solid #ddd;padding-left:16px' if i > 0 else ''
         mid_html += f'<td valign="top" style="width:33%;{border}">{article_html(a,"15px",True)}</td>'
 
-    # Bottom stories — 2 column
     half = len(tier3) // 2 + len(tier3) % 2
     left_stories  = "".join(article_html(a, "13px", True) for a in tier3[:half])
     right_stories = "".join(article_html(a, "13px", True) for a in tier3[half:])
 
-    # Sports scores
     scores_html = ""
     for s in sports.get("scores", [])[:8]:
         home_w = s.get("winner") == "home"
@@ -202,7 +223,6 @@ def build_email_html(today: str, quote: dict, markets: list, articles: list, spo
 <tr><td align="center">
 <table width="680" cellpadding="0" cellspacing="0" style="background:#f7f4ee;max-width:680px;width:100%">
 
-  <!-- MASTHEAD -->
   <tr><td style="padding:20px 36px 0">
     <table width="100%" cellpadding="0" cellspacing="0">
       <tr>
@@ -219,13 +239,11 @@ def build_email_html(today: str, quote: dict, markets: list, articles: list, spo
     <p style="font-family:Arial,sans-serif;font-size:10px;letter-spacing:0.18em;text-transform:uppercase;color:#888;text-align:center;margin:6px 0 0">Manufacturing · Finance · Technology · Science · World Affairs · Sports</p>
   </td></tr>
 
-  <!-- QUOTE -->
   <tr><td style="background:#ede9e0;border-top:2px solid #1a1714;border-bottom:2px solid #1a1714;padding:10px 36px;text-align:center">
     <p style="font-family:Georgia,serif;font-size:14px;font-style:italic;color:#3d3830;margin:0 0 4px;line-height:1.5">"{quote.get("quote","")}"</p>
     <span style="font-family:Arial,sans-serif;font-size:10px;font-weight:500;letter-spacing:0.12em;text-transform:uppercase;color:#999">— {quote.get("author","")}</span>
   </td></tr>
 
-  <!-- MARKETS -->
   <tr><td style="background:#1a1714;padding:8px 36px">
     <table cellpadding="0" cellspacing="0"><tr>
       <td style="font-family:Arial,sans-serif;font-size:9px;font-weight:600;letter-spacing:0.14em;text-transform:uppercase;color:#aaa;padding-right:16px;white-space:nowrap">Markets</td>
@@ -233,7 +251,6 @@ def build_email_html(today: str, quote: dict, markets: list, articles: list, spo
     </tr></table>
   </td></tr>
 
-  <!-- TOP STORIES -->
   <tr><td style="padding:0 36px">
     <div style="border-top:3px solid #1a1714;padding-top:4px;margin-top:18px;margin-bottom:14px">
       <span style="font-family:Arial,sans-serif;font-size:9px;font-weight:600;letter-spacing:0.18em;text-transform:uppercase">Top Stories</span>
@@ -241,10 +258,8 @@ def build_email_html(today: str, quote: dict, markets: list, articles: list, spo
     <table width="100%" cellpadding="0" cellspacing="0"><tr>{top_html}</tr></table>
   </td></tr>
 
-  <!-- DIVIDER -->
   <tr><td style="padding:0 36px"><hr style="border:none;border-top:1px solid #ccc;margin:16px 0 0"></td></tr>
 
-  <!-- MID STORIES -->
   <tr><td style="padding:0 36px">
     <div style="border-top:3px solid #1a1714;padding-top:4px;margin-top:14px;margin-bottom:14px">
       <span style="font-family:Arial,sans-serif;font-size:9px;font-weight:600;letter-spacing:0.18em;text-transform:uppercase">Business · Technology · Science</span>
@@ -252,10 +267,8 @@ def build_email_html(today: str, quote: dict, markets: list, articles: list, spo
     <table width="100%" cellpadding="0" cellspacing="0"><tr>{mid_html}</tr></table>
   </td></tr>
 
-  <!-- DIVIDER -->
   <tr><td style="padding:0 36px"><hr style="border:none;border-top:1px solid #ccc;margin:16px 0 0"></td></tr>
 
-  <!-- BOTTOM STORIES -->
   <tr><td style="padding:0 36px">
     <div style="border-top:3px solid #1a1714;padding-top:4px;margin-top:14px;margin-bottom:14px">
       <span style="font-family:Arial,sans-serif;font-size:9px;font-weight:600;letter-spacing:0.18em;text-transform:uppercase">World · Health · Policy</span>
@@ -268,10 +281,8 @@ def build_email_html(today: str, quote: dict, markets: list, articles: list, spo
     </table>
   </td></tr>
 
-  <!-- DIVIDER -->
   <tr><td style="padding:0 36px"><hr style="border:none;border-top:1px solid #ccc;margin:16px 0 0"></td></tr>
 
-  <!-- SPORTS -->
   <tr><td style="padding:0 36px">
     <div style="border-top:3px solid #1a1714;padding-top:4px;margin-top:14px;margin-bottom:14px">
       <span style="font-family:Arial,sans-serif;font-size:9px;font-weight:600;letter-spacing:0.18em;text-transform:uppercase">Sports</span>
@@ -284,7 +295,6 @@ def build_email_html(today: str, quote: dict, markets: list, articles: list, spo
     </table>
   </td></tr>
 
-  <!-- FOOTER -->
   <tr><td style="padding:20px 36px 36px;text-align:center;border-top:3px double #1a1714;margin-top:28px">
     <p style="font-family:Arial,sans-serif;font-size:9px;color:#aaa;letter-spacing:0.06em;margin:0">
       The Lundquist Letter &nbsp;·&nbsp; Curated by Claude &nbsp;·&nbsp; Cypress, Texas<br>
@@ -302,7 +312,6 @@ def build_email_html(today: str, quote: dict, markets: list, articles: list, spo
 # ── GMAIL SENDER ─────────────────────────────────────────────────────────────
 
 def get_gmail_service():
-    """Build Gmail service from OAuth credentials stored as env vars."""
     creds_json = os.environ.get("GMAIL_CREDENTIALS_JSON")
     if not creds_json:
         raise ValueError("GMAIL_CREDENTIALS_JSON environment variable not set.")
